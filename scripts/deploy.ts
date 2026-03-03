@@ -47,13 +47,14 @@ async function main() {
 
   const Gov = await ethers.getContractFactory("GovernanceCore");
   const governance = await Gov.deploy(
-    await votes.getAddress(),
-    deployer.address,
-    votingDelay,
-    votingPeriod,
-    quorumBps,
-    proposalThreshold
-  );
+      await votes.getAddress(),
+      await timelock.getAddress(),
+      deployer.address,
+      1,                       // votingDelay (blocks)
+      45818,                   // votingPeriod (~1 week)
+      2000,                    // quorumBps (20%)
+      ethers.parseEther("100") // proposal threshold
+    );
   await governance.waitForDeployment();
 
   console.log("GovernanceCore:", await governance.getAddress());
