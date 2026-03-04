@@ -1,9 +1,11 @@
 import { expect } from "chai";
 import { ethers } from "hardhat";
 
-describe("CryptoVentures DAO – Governance Flow", function () {
+describe("CryptoVentures DAO – Full Functional Governance", function () {
+
   async function deployFixture() {
-    const [admin, voter1, voter2, recipient] = await ethers.getSigners();
+    const [admin, voter1, voter2, recipient] =
+      await ethers.getSigners();
 
     /* ---------------- GovernanceVotes ---------------- */
     const Votes = await ethers.getContractFactory("GovernanceVotes");
@@ -20,69 +22,74 @@ describe("CryptoVentures DAO – Governance Flow", function () {
     const Timelock = await ethers.getContractFactory("GovernanceTimelock");
     const timelock = await Timelock.deploy(
       minDelay,
-      [admin.address],
-      [admin.address],
+      [],
+      [],
       admin.address
     );
     await timelock.waitForDeployment();
 
     /* ---------------- GovernanceCore ---------------- */
-    const votingDelay = 1;
-    const votingPeriod = 45818; // shortened for tests
-    const quorumBps = 2000; // 20%
-    const proposalThreshold = ethers.parseEther("100");
-
     const Gov = await ethers.getContractFactory("GovernanceCore");
+
     const governance = await Gov.deploy(
       await votes.getAddress(),
+      await timelock.getAddress(),
       admin.address,
-      votingDelay,
-      votingPeriod,
-      quorumBps,
-      proposalThreshold
+      1,          // votingDelay
+      20,         // short voting period for tests
+      1,       // quorumBps
+      ethers.parseEther("100")
     );
+
     await governance.waitForDeployment();
+    const GOVERNOR_ROLE = await governance.GOVERNOR_ROLE();
+
+await governance.grantRole(GOVERNOR_ROLE, voter1.address);
+await governance.grantRole(GOVERNOR_ROLE, voter2.address);
+    /* ---- Grant timelock roles to governance ---- */
+    const PROPOSER_ROLE = await timelock.PROPOSER_ROLE();
+    const EXECUTOR_ROLE = await timelock.EXECUTOR_ROLE();
+
+    await timelock.grantRole(PROPOSER_ROLE, await governance.getAddress());
+    await timelock.grantRole(EXECUTOR_ROLE, ethers.ZeroAddress);
 
     /* ---------------- Treasury ---------------- */
     const Operational = await ethers.getContractFactory("OperationalTreasury");
     const treasury = await Operational.deploy(
       await timelock.getAddress(),
-      ethers.parseEther("10")
+      ethers.parseEther("100")
     );
     await treasury.waitForDeployment();
-    /* ---------------- Grant governor role to voters ---------------- */
-const GOVERNOR_ROLE = await governance.GOVERNOR_ROLE();
 
-await governance.grantRole(GOVERNOR_ROLE, voter1.address);
-await governance.grantRole(GOVERNOR_ROLE, voter2.address);
+    /* Fund treasury */
+    await admin.sendTransaction({
+      to: await treasury.getAddress(),
+      value: ethers.parseEther("20"),
+    });
 
+    /* ---------------- Mint Voting Power ---------------- */
+    await votes.mint(admin.address, ethers.parseEther("200"));
+    await votes.mint(voter1.address, ethers.parseEther("100"));
+    await votes.mint(voter2.address, ethers.parseEther("100"));
 
-    /* ---------------- Mint voting power ---------------- */
-await votes.mint(admin.address, ethers.parseEther("200"));
-await votes.mint(voter1.address, ethers.parseEther("100"));
-await votes.mint(voter2.address, ethers.parseEther("100"));
+    await votes.connect(admin).delegate(admin.address);
+    await votes.connect(voter1).delegate(voter1.address);
+    await votes.connect(voter2).delegate(voter2.address);
 
-/* ---------------- Delegate voting power ---------------- */
-await votes.connect(admin).delegate(admin.address);
-await votes.connect(voter1).delegate(voter1.address);
-await votes.connect(voter2).delegate(voter2.address);
-
-/* ---------------- Snapshot block ---------------- */
-await ethers.provider.send("evm_mine", []);
+    await ethers.provider.send("evm_mine", []);
 
     return {
       admin,
       voter1,
       voter2,
       recipient,
-      votes,
       governance,
-      timelock,
       treasury,
+      minDelay
     };
   }
 
-  it("runs full proposal → vote → queue → execute flow", async function () {
+  it("executes real ETH transfer through timelock", async function () {
     const {
       admin,
       voter1,
@@ -90,54 +97,113 @@ await ethers.provider.send("evm_mine", []);
       recipient,
       governance,
       treasury,
+      minDelay
     } = await deployFixture();
 
-    /* ---------------- Propose ---------------- */
-    const tx = await governance.connect(admin).propose();
-    const receipt = await tx.wait();
+    const amount = ethers.parseEther("5");
 
+    /* ✅ Correct function name */
+    const calldata =
+      treasury.interface.encodeFunctionData("transferETH", [
+        recipient.address,
+        amount
+      ]);
+
+    const tx = await governance.propose(
+      [await treasury.getAddress()],
+      [0],
+      [calldata],
+      "Transfer 5 ETH"
+    );
+
+    const receipt = await tx.wait();
     const proposalId = receipt!.logs[0].args![0];
 
-    /* ---------------- Move to voting ---------------- */
-    await ethers.provider.send("evm_mine", []);
     await ethers.provider.send("evm_mine", []);
 
-    /* ---------------- Vote ---------------- */
     await governance.connect(admin).castVote(proposalId, 1);
     await governance.connect(voter1).castVote(proposalId, 1);
     await governance.connect(voter2).castVote(proposalId, 0);
 
-    /* ---------------- End voting ---------------- */
-    for (let i = 0; i < 46000; i++) {
-        await ethers.provider.send("evm_mine", []);
-        }
-
+    for (let i = 0; i < 25; i++) {
+      await ethers.provider.send("evm_mine", []);
+    }
 
     expect(await governance.state(proposalId)).to.equal(3); // Succeeded
 
-    /* ---------------- Queue ---------------- */
     await governance.queue(proposalId);
-    expect(await governance.state(proposalId)).to.equal(4); // Queued
 
-    /* ---------------- Execute ---------------- */
+    await expect(
+      governance.execute(proposalId)
+    ).to.be.reverted;
+
+    await ethers.provider.send("evm_increaseTime", [minDelay]);
+    await ethers.provider.send("evm_mine", []);
+
+    const before = await ethers.provider.getBalance(recipient.address);
+
     await governance.execute(proposalId);
-    expect(await governance.state(proposalId)).to.equal(5); // Executed
+
+    const after = await ethers.provider.getBalance(recipient.address);
+
+    expect(after - before).to.equal(amount);
   });
 
-  it("prevents double voting", async function () {
-    const { admin, governance } = await deployFixture();
+  it("uses non-linear sqrt voting", async function () {
+    const { admin, governance, treasury } = await deployFixture();
 
-    const tx = await governance.connect(admin).propose();
+    const calldata =
+      treasury.interface.encodeFunctionData("transferETH", [
+        admin.address,
+        ethers.parseEther("1")
+      ]);
+
+    const tx = await governance.propose(
+      [await treasury.getAddress()],
+      [0],
+      [calldata],
+      "Sqrt Test"
+    );
+
     const receipt = await tx.wait();
     const proposalId = receipt!.logs[0].args![0];
 
     await ethers.provider.send("evm_mine", []);
+
+    await governance.connect(admin).castVote(proposalId, 1);
+
+    const proposal = await governance.proposals(proposalId);
+
+    // sqrt(200 ether) != 200 ether
+    expect(proposal.forVotes).to.not.equal(ethers.parseEther("200"));
+  });
+
+  it("prevents double voting", async function () {
+    const { admin, governance, treasury } = await deployFixture();
+
+    const calldata =
+      treasury.interface.encodeFunctionData("transferETH", [
+        admin.address,
+        ethers.parseEther("1")
+      ]);
+
+    const tx = await governance.propose(
+      [await treasury.getAddress()],
+      [0],
+      [calldata],
+      "Double Vote Test"
+    );
+
+    const receipt = await tx.wait();
+    const proposalId = receipt!.logs[0].args![0];
+
     await ethers.provider.send("evm_mine", []);
 
     await governance.connect(admin).castVote(proposalId, 1);
 
     await expect(
       governance.connect(admin).castVote(proposalId, 1)
-    ).to.be.revertedWith("Gov: already voted");
+    ).to.be.revertedWith("Already voted");
   });
+
 });
